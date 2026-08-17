@@ -1,0 +1,391 @@
+"""
+========================================================================
+3D Mahalanobis Association Metric
+========================================================================
+
+Computes the Mahalanobis distance between a Track state estimate
+and a 3D DetectionResult position.
+
+Canonical state:
+
+    [x, y, z,
+     vx, vy, vz,
+     ax, ay, az]
+
+Measurement:
+
+    [x, y, z]
+
+Measurement model:
+
+    z = Hx + v
+
+where H extracts the position components from the 9-state
+constant-acceleration model.
+
+Lower value
+    -> better association
+
+Higher value
+    -> worse association
+
+========================================================================
+"""
+
+from __future__ import annotations
+
+import numpy as np
+
+from core.detection_result import DetectionResult
+
+from tracking.models.track import Track
+from tracking.similarity.base_metric import BaseMetric
+
+
+class MahalanobisMetric(BaseMetric):
+
+    """
+    Mahalanobis distance for 3D position association.
+
+    This metric compares:
+
+        predicted Track position
+
+    against:
+
+        DetectionResult.position
+
+    while accounting for uncertainty in the Track covariance.
+    """
+
+    # ==================================================================
+    # Constructor
+    # ==================================================================
+
+    def __init__(
+        self,
+        measurement_noise: float = 1.0,
+        invalid_cost: float = 1e9,
+        covariance_floor: float = 1e-9,
+    ) -> None:
+
+        super().__init__(
+            invalid_cost=invalid_cost
+        )
+
+        if measurement_noise <= 0.0:
+            raise ValueError(
+                "measurement_noise must be "
+                "greater than zero."
+            )
+
+        if covariance_floor <= 0.0:
+            raise ValueError(
+                "covariance_floor must be "
+                "greater than zero."
+            )
+
+        self.measurement_noise = float(
+            measurement_noise
+        )
+
+        self.covariance_floor = float(
+            covariance_floor
+        )
+
+    # ==================================================================
+    # Measurement Matrix
+    # ==================================================================
+
+    @staticmethod
+    def measurement_matrix() -> np.ndarray:
+        """
+        Return the 3D position measurement matrix.
+
+        State:
+
+            [x, y, z,
+             vx, vy, vz,
+             ax, ay, az]
+
+        Measurement:
+
+            [x, y, z]
+        """
+
+        H = np.zeros(
+            (3, 9),
+            dtype=float,
+        )
+
+        H[0, 0] = 1.0
+        H[1, 1] = 1.0
+        H[2, 2] = 1.0
+
+        return H
+
+    # ==================================================================
+    # Measurement Noise
+    # ==================================================================
+
+    def measurement_noise_matrix(
+        self,
+    ) -> np.ndarray:
+        """
+        Return measurement covariance R.
+        """
+
+        return (
+            np.eye(
+                3,
+                dtype=float,
+            )
+            * self.measurement_noise
+        )
+
+    # ==================================================================
+    # Compute
+    # ==================================================================
+
+    def compute(
+        self,
+        track: Track,
+        detection: DetectionResult,
+    ) -> float:
+        """
+        Compute 3D Mahalanobis distance.
+
+        Returns
+        -------
+        float
+            Mahalanobis distance.
+
+        A value of ``invalid_cost`` is returned when
+        the association cannot be evaluated.
+        """
+
+        # --------------------------------------------------------------
+        # Track state validation
+        # --------------------------------------------------------------
+
+        if track.state_vector is None:
+            return self.invalid_cost
+
+        # --------------------------------------------------------------
+        # Detection position validation
+        # --------------------------------------------------------------
+
+        if detection.position is None:
+            return self.invalid_cost
+
+        state = track.state_vector
+
+        # --------------------------------------------------------------
+        # State dimension validation
+        # --------------------------------------------------------------
+
+        x = np.asarray(
+            state.state,
+            dtype=float,
+        )
+
+        if x.shape != (9,):
+            return self.invalid_cost
+
+        # --------------------------------------------------------------
+        # Covariance validation
+        # --------------------------------------------------------------
+
+        P = np.asarray(
+            state.covariance,
+            dtype=float,
+        )
+
+        if P.shape != (9, 9):
+            return self.invalid_cost
+
+        if not np.all(
+            np.isfinite(P)
+        ):
+            return self.invalid_cost
+
+        # --------------------------------------------------------------
+        # Measurement matrix
+        # --------------------------------------------------------------
+
+        H = self.measurement_matrix()
+
+        # --------------------------------------------------------------
+        # Detection measurement
+        # --------------------------------------------------------------
+
+        z = np.array(
+            [
+                detection.position.x,
+                detection.position.y,
+                detection.position.z,
+            ],
+            dtype=float,
+        )
+
+        if not np.all(
+            np.isfinite(z)
+        ):
+            return self.invalid_cost
+
+        # --------------------------------------------------------------
+        # Measurement noise
+        # --------------------------------------------------------------
+
+        R = self.measurement_noise_matrix()
+
+        # --------------------------------------------------------------
+        # Innovation
+        #
+        #     y = z - Hx
+        # --------------------------------------------------------------
+
+        innovation = (
+            z
+            - H @ x
+        )
+
+        # --------------------------------------------------------------
+        # Innovation covariance
+        #
+        #     S = HPHᵀ + R
+        # --------------------------------------------------------------
+
+        S = (
+            H
+            @ P
+            @ H.T
+            + R
+        )
+
+        # --------------------------------------------------------------
+        # Numerical stabilization
+        # --------------------------------------------------------------
+
+        S = (
+            0.5
+            * (
+                S
+                + S.T
+            )
+        )
+
+        S += (
+            np.eye(3)
+            * self.covariance_floor
+        )
+
+        # --------------------------------------------------------------
+        # Solve S y = innovation
+        #
+        # Avoid explicit matrix inversion.
+        # --------------------------------------------------------------
+
+        try:
+
+            solved = np.linalg.solve(
+                S,
+                innovation,
+            )
+
+        except np.linalg.LinAlgError:
+
+            return self.invalid_cost
+
+        # --------------------------------------------------------------
+        # Mahalanobis distance squared
+        #
+        #     d² = yᵀ S⁻¹ y
+        # --------------------------------------------------------------
+
+        distance_squared = float(
+            innovation.T
+            @ solved
+        )
+
+        # Numerical round-off can occasionally
+        # produce a tiny negative number.
+
+        if distance_squared < 0.0:
+
+            if distance_squared > -1e-9:
+
+                distance_squared = 0.0
+
+            else:
+
+                return self.invalid_cost
+
+        # --------------------------------------------------------------
+        # Final distance
+        # --------------------------------------------------------------
+
+        distance = float(
+            np.sqrt(
+                distance_squared
+            )
+        )
+
+        if not np.isfinite(
+            distance
+        ):
+            return self.invalid_cost
+
+        return distance
+
+    # ==================================================================
+    # Configuration
+    # ==================================================================
+
+    @property
+    def requires_position(self) -> bool:
+        return True
+
+    # ==================================================================
+
+    def get_config(self) -> dict:
+
+        config = super().get_config()
+
+        config.update(
+            {
+                "measurement_noise":
+                    self.measurement_noise,
+
+                "covariance_floor":
+                    self.covariance_floor,
+
+                "dimensions":
+                    3,
+
+                "state_dimension":
+                    9,
+
+                "state_model":
+                    "constant_acceleration",
+
+                "measurement_model":
+                    "3d_position",
+            }
+        )
+
+        return config
+
+    # ==================================================================
+    # Representation
+    # ==================================================================
+
+    def __repr__(self) -> str:
+
+        return (
+            "MahalanobisMetric("
+            f"measurement_noise="
+            f"{self.measurement_noise}, "
+            f"invalid_cost="
+            f"{self.invalid_cost})"
+        )
